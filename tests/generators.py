@@ -130,6 +130,21 @@ def enumerate_k_grouped_contiguous():
         yield num_groups, m, n, major_a, major_b, ks, expected_k_per_group
 
 
+def enumerate_k_grouped_contiguous_bf16():
+    """Enumerate test configurations for BF16 K-grouped GEMM."""
+    # K dimension must be aligned to 64 for bmk_bnk kernels
+    alignment = 64
+    for num_groups, m, n, expected_k_per_group in (( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
+                                                   ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
+                                                   (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
+        # Generate random K values around expected_k_per_group, aligned to 64
+        ks = [align(int(expected_k_per_group * random.uniform(0.7, 1.3)), alignment) for _ in range(num_groups)]
+        # Make sure max K is aligned to 64
+        max_k = max(ks)
+        assert max_k % alignment == 0
+        yield num_groups, m, n, ks, expected_k_per_group
+
+
 def enumerate_sf_layout():
     for use_ue8m0 in (False, True):
         for with_transpose in (True, False):
@@ -276,3 +291,36 @@ def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: Majo
         assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
 
     return k, a_fp8, b_fp8, c, d, ref_d
+
+
+def generate_k_grouped_contiguous_bf16(num_groups: int, m: int, n: int, ks: List[int], accumulate: bool):
+    """Generate test data for BF16 K-grouped contiguous GEMM."""
+    k = sum(ks)
+
+    # Generate input tensors in row-major format [k, m] and [k, n]
+    a = torch.randn((k, m), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((k, n), device='cuda', dtype=torch.bfloat16)
+
+    # Output dtype depends on accumulation
+    out_dtype = torch.float if accumulate else torch.bfloat16
+    c = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else None
+    d = torch.empty((m, n), device='cuda', dtype=out_dtype) if c is None else c.clone()
+    ref_d = torch.empty_like(d)
+
+    # Compute reference using PyTorch
+    # D = C + sum_over_groups(A_g @ B_g) where A_g is transposed
+    if accumulate:
+        ref_d = c.clone()
+    else:
+        ref_d.zero_()
+
+    start = 0
+    for i, group_k in enumerate(ks):
+        end = start + group_k
+        # a[start:end] is [group_k, m], transposed is [m, group_k]
+        # b[start:end] is [group_k, n]
+        # result is [m, n]
+        ref_d += (a[start:end].T @ b[start:end]).to(out_dtype)
+        start = end
+
+    return k, a, b, c, d, ref_d

@@ -36,6 +36,7 @@ from deep_gemm_cpp import (
     bf16_gemm_tn, bf16_gemm_tt,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
+    k_grouped_bf16_gemm_tn_contiguous,
     # cuBLASLt GEMMs
     cublaslt_gemm_nt, cublaslt_gemm_nn,
     cublaslt_gemm_tn, cublaslt_gemm_tt,

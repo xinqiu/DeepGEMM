@@ -6,6 +6,8 @@
 #include "../jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm90_bmk_bnk_mn.hpp"
+#include "../jit_kernels/impls/sm100_bmk_bnk_mn.hpp"
 
 #include "layout.hpp"
 
@@ -321,6 +323,90 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     }
 }
 
+static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
+                                               const torch::Tensor& b,
+                                               const torch::Tensor& d,
+                                               const std::vector<int>& ks,
+                                               const torch::Tensor& ks_tensor,
+                                               const std::optional<torch::Tensor>& c,
+                                               const std::string& compiled_dims) {
+    // Contiguity checks
+    DG_HOST_ASSERT(a.is_contiguous());
+    DG_HOST_ASSERT(b.is_contiguous());
+    DG_HOST_ASSERT(d.is_contiguous());
+
+    // Type checks
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+
+    // Check accumulation tensor
+    if (c.has_value()) {
+        DG_HOST_ASSERT(c.value().scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(c.value().is_contiguous());
+        DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());
+    }
+
+    // Do nothing if empty
+    if (std::accumulate(ks.begin(), ks.end(), 0) == 0)
+        return;
+
+    // Get dimensions
+    const auto& [_, m] = get_shape<2>(a);
+    const auto& [__, n] = get_shape<2>(b);
+    const auto& num_groups = static_cast<int>(ks.size());
+    int sum_k = std::accumulate(ks.begin(), ks.end(), 0);
+
+    // Validate shapes
+    DG_HOST_ASSERT(a.numel() == m * sum_k);
+    DG_HOST_ASSERT(b.numel() == n * sum_k);
+
+    // If output is BF16, we need to accumulate in FP32 workspace first
+    if (d.scalar_type() == torch::kBFloat16) {
+        DG_HOST_ASSERT(not c.has_value());
+
+        const auto& workspace = torch::empty_like(d, d.options().dtype(torch::kFloat32));
+        DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(workspace.data_ptr(), 0, workspace.nbytes(),
+                              c10::cuda::getCurrentCUDAStream()));
+        k_grouped_bf16_gemm_tn_contiguous(a, b, workspace, ks, ks_tensor, workspace, compiled_dims);
+
+        // This line has an implicit FP32-to-BF16 casting
+        d.copy_(workspace);
+        return;
+    }
+
+    // Reshape tensors into [num_groups, m, max_k] and [num_groups, n, max_k] format
+    // We need to pad the K dimension for groups with different K values
+    int max_k = *std::max_element(ks.begin(), ks.end());
+    DG_HOST_ASSERT(max_k % 64 == 0, "max_k must be divisible by 64");
+
+    auto a_grouped = torch::zeros({num_groups, m, max_k}, a.options());
+    auto b_grouped = torch::zeros({num_groups, n, max_k}, b.options());
+
+    // Copy data group by group
+    int k_offset = 0;
+    for (int g = 0; g < num_groups; ++g) {
+        if (ks[g] > 0) {
+            auto a_slice = a.slice(0, k_offset, k_offset + ks[g]).reshape({ks[g], m}).t(); // [m, ks[g]]
+            auto b_slice = b.slice(0, k_offset, k_offset + ks[g]).reshape({ks[g], n}).t(); // [n, ks[g]]
+            a_grouped[g].slice(1, 0, ks[g]).copy_(a_slice);
+            b_grouped[g].slice(1, 0, ks[g]).copy_(b_slice);
+            k_offset += ks[g];
+        }
+    }
+
+    // Dispatch implementation
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        sm90_bmn_bnk_mn_gemm(a_grouped, b_grouped, d, num_groups, m, n, max_k);
+    } else if (arch_major == 10) {
+        sm100_bmn_bnk_mn_gemm(a_grouped, b_grouped, d, num_groups, m, n, max_k);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+}
+
 static void bf16_gemm_nt(const torch::Tensor& a,
                          const torch::Tensor& b,
                          const torch::Tensor& d,
@@ -568,6 +654,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("compiled_dims") = "nk");
+    m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks"),
+          py::arg("ks_tensor"), py::arg("c") = std::nullopt,
+          py::arg("compiled_dims") = "mn");
 
     // cuBLASLt GEMMs
     m.def("cublaslt_gemm_nt", &cublaslt_gemm_nt,

@@ -9,7 +9,8 @@ from deep_gemm.testing import (
 from generators import (
     get_arch_major,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, generate_normal,
-    generate_m_grouped_contiguous, generate_m_grouped_masked
+    generate_m_grouped_contiguous, generate_m_grouped_masked,
+    enumerate_k_grouped_contiguous_bf16, generate_k_grouped_contiguous_bf16
 )
 
 
@@ -110,6 +111,37 @@ def test_m_grouped_gemm_masked() -> None:
     print()
 
 
+def test_k_grouped_gemm_contiguous() -> None:
+    print('Testing k-grouped contiguous GEMM:')
+
+    for num_groups, m, n, ks, expected_k_per_group in enumerate_k_grouped_contiguous_bf16():
+        # Test without accumulation (BF16 output)
+        for accumulate in (False, True):
+            k, a, b, c, d, ref_d = generate_k_grouped_contiguous_bf16(num_groups, m, n, ks, accumulate)
+            ks_tensor = torch.tensor(ks, dtype=torch.int, device='cuda')
+
+            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c)
+
+            diff = calc_diff(d, ref_d)
+            out_dtype = 'FP32' if accumulate else 'BF16'
+            assert diff < 0.001, f'{m=}, {n=}, k={k}, {num_groups=}, {out_dtype=}, {diff:.5f}'
+
+        # Benchmark with FP32 accumulation
+        k, a, b, c, d, ref_d = generate_k_grouped_contiguous_bf16(num_groups, m, n, ks, accumulate=True)
+        ks_tensor = torch.tensor(ks, dtype=torch.int, device='cuda')
+
+        # noinspection PyShadowingNames
+        def test_func():
+            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c)
+
+        t = bench_kineto(test_func, 'bf16_gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=:3}, m={m:5}, n={n:5}, k={k:6}, expected_k={expected_k_per_group:5}): '
+              f'{t * 1e6:5.0f} us | '
+              f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
+    print()
+
+
 def test_cublaslt_gemm() -> None:
     print('Testing cuBLASLt GEMM:')
     for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(dtype=torch.bfloat16):
@@ -145,5 +177,8 @@ if __name__ == '__main__':
     if get_arch_major() == 9:
         test_m_grouped_gemm_contiguous()
         test_m_grouped_gemm_masked()
+
+    # K-grouped GEMM supports both SM90 and SM100
+    test_k_grouped_gemm_contiguous()
 
     test_cublaslt_gemm()

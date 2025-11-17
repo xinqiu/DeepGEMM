@@ -304,13 +304,14 @@ def generate_k_grouped_contiguous_bf16(num_groups: int, m: int, n: int, ks: List
     # Output dtype depends on accumulation
     out_dtype = torch.float if accumulate else torch.bfloat16
     c = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else None
-    d = torch.empty((m, n), device='cuda', dtype=out_dtype) if c is None else c.clone()
+    # For accumulation, d must be the same tensor as c (in-place accumulation)
+    d = torch.empty((m, n), device='cuda', dtype=out_dtype) if c is None else c
     ref_d = torch.empty_like(d)
 
     # Compute reference using PyTorch
     # D = C + sum_over_groups(A_g @ B_g) where A_g is transposed
     if accumulate:
-        ref_d = c.clone()
+        ref_d.copy_(c)
     else:
         ref_d.zero_()
 

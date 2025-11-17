@@ -120,6 +120,12 @@ def test_k_grouped_gemm_contiguous() -> None:
             k, a, b, c, d, ref_d = generate_k_grouped_contiguous_bf16(num_groups, m, n, ks, accumulate)
             ks_tensor = torch.tensor(ks, dtype=torch.int, device='cuda')
 
+            # Debug: verify c and d are the same object when accumulate=True
+            if accumulate:
+                assert c is not None, "c should not be None when accumulate=True"
+                assert d is c, f"d must be the same object as c when accumulate=True, but d is c: {d is c}"
+                assert c.data_ptr() == d.data_ptr(), f"c and d must have same data_ptr"
+
             deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c)
 
             diff = calc_diff(d, ref_d)

@@ -267,6 +267,62 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
     }
 }
 
+static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
+                                             const torch::Tensor& b,
+                                             const torch::Tensor& d,
+                                             const std::vector<int>& ks,
+                                             const torch::Tensor& ks_tensor,
+                                             const std::optional<torch::Tensor>& c,
+                                             const std::string& compiled_dims) {
+    // Type and contiguity checks
+    DG_HOST_ASSERT(a.is_contiguous());
+    DG_HOST_ASSERT(b.is_contiguous());
+    DG_HOST_ASSERT(d.is_contiguous());
+    DG_HOST_ASSERT(ks_tensor.scalar_type() == torch::kInt and ks_tensor.is_contiguous());
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    check_major_type_cd(d);
+    if (c.has_value()) {
+        DG_HOST_ASSERT(c->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(c->is_contiguous());
+    }
+
+    const auto& [num_groups, m_, n_] = get_shape<3>(d);
+    DG_HOST_ASSERT(static_cast<int>(ks.size()) == num_groups);
+
+    const auto& sum_k = std::accumulate(ks.begin(), ks.end(), 0);
+    if (sum_k == 0)
+        return;
+
+    // Infer layouts: SM90 uses flattened K-major inputs
+    torch::Tensor a_view = a;
+    torch::Tensor b_view = b;
+    int m = m_, n = n_;
+    if (a.dim() == 1 and b.dim() == 1) {
+        DG_HOST_ASSERT(a.numel() == sum_k * m);
+        DG_HOST_ASSERT(b.numel() == sum_k * n);
+        a_view = a.view({sum_k, m});
+        b_view = b.view({sum_k, n});
+    }
+
+    const auto& [k, m_check] = get_shape<2>(a_view);
+    const auto& [k_, n_check] = get_shape<2>(b_view);
+    DG_HOST_ASSERT(k == k_ and m_check == m and n_check == n);
+
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9) {
+        DG_HOST_ASSERT(not c.has_value());
+        sm90_bf16_k_grouped_gemm_contiguous(a_view, b_view, c, d, m, n, ks, ks_tensor,
+                                            cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
+    } else if (arch_major == 10) {
+        sm100_bf16_k_grouped_gemm_contiguous(a_view, b_view, c, d, m, n, ks, ks_tensor,
+                                             cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+}
+
 static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                              const std::pair<torch::Tensor, torch::Tensor>& b,
                                              const torch::Tensor& d,
@@ -568,6 +624,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("compiled_dims") = "nk");
+    m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks"),
+          py::arg("ks_tensor"), py::arg("c") = std::nullopt,
+          py::arg("compiled_dims") = "mn");
 
     // cuBLASLt GEMMs
     m.def("cublaslt_gemm_nt", &cublaslt_gemm_nt,

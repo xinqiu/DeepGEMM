@@ -241,21 +241,35 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
     return a_fp8, b_fp8, masked_m, d, ref_d
 
 
-def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks: List[int], use_ue8m0: bool):
+def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks: List[int], use_ue8m0: bool, use_bf16: bool = False, accumulate: bool = True):
     assert get_mk_alignment_for_contiguous_layout() % 128 == 0
     k = sum(ks)
 
     a = torch.randn((k, m), device='cuda', dtype=torch.bfloat16)
     b = torch.randn((k, n), device='cuda', dtype=torch.bfloat16)
-    c = torch.randn((num_groups, m, n), device='cuda', dtype=torch.float) * 32
-    d = c
-    ref_d = torch.empty_like(c)
+    c = torch.randn((num_groups, m, n), device='cuda', dtype=torch.float) * 32 if accumulate else None
+    d = c if accumulate else torch.zeros((num_groups, m, n), device='cuda', dtype=torch.bfloat16)
+    ref_d = torch.empty((num_groups, m, n), device='cuda', dtype=torch.float)
 
     start = 0
     for i, group_k in enumerate(ks):
         end = start + group_k
-        ref_d[i] = c[i] + (a[start:end].T @ b[start:end])
+        ref_d[i] = (c[i] if accumulate else 0) + (a[start:end].T @ b[start:end])
         start = end
+
+    if use_bf16:
+        if (major_a, major_b) == (MajorTypeAB.KMajor, MajorTypeAB.KMajor):
+            new_a = torch.empty((sum(ks) * m, ), dtype=a.dtype, device=a.device)
+            new_b = torch.empty((sum(ks) * n, ), dtype=b.dtype, device=b.device)
+            prefix = 0
+            for K in ks:
+                new_a[prefix * m : (prefix + K) * m] = a[prefix : prefix + K, ].T.flatten()
+                new_b[prefix * n : (prefix + K) * n] = b[prefix : prefix + K, ].T.flatten()
+                prefix += K
+            return k, new_a, new_b, c, d, ref_d
+        else:
+            assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
+            return k, a, b, c, d, ref_d
 
     a_fp8 = per_channel_cast_to_fp8(a, use_ue8m0=use_ue8m0)
     b_fp8 = per_channel_cast_to_fp8(b, use_ue8m0=use_ue8m0)

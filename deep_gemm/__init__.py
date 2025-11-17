@@ -31,6 +31,7 @@ from deep_gemm_cpp import (
     m_grouped_fp8_gemm_nt_masked,
     k_grouped_fp8_gemm_nt_contiguous,
     k_grouped_fp8_gemm_tn_contiguous,
+    k_grouped_bf16_gemm_tn_contiguous,
     # BF16 GEMMs
     bf16_gemm_nt, bf16_gemm_nn,
     bf16_gemm_tn, bf16_gemm_tt,

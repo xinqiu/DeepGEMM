@@ -120,6 +120,78 @@ static void sm90_bf16_gemm(const torch::Tensor& a,
     SM90BF16GemmRuntime::launch(runtime, args);
 }
 
+static void sm90_bf16_k_grouped_gemm_contiguous(const torch::Tensor& a,
+                                                const torch::Tensor& b,
+                                                const std::optional<torch::Tensor>& c,
+                                                const torch::Tensor& d,
+                                                const int& m, const int& n,
+                                                const std::vector<int>& ks, const torch::Tensor& ks_tensor,
+                                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                const std::string& compiled_dims) {
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+
+    int sum_k = 0, max_k = 0;
+    for (const auto& k: ks) {
+        sum_k += k;
+        max_k = std::max(max_k, k);
+        DG_HOST_ASSERT(k % 128 == 0);
+    }
+    const auto& num_groups = static_cast<int>(ks.size());
+
+    const auto& config = get_best_config<SM90ArchSpec>(
+        GemmType::KGroupedContiguous, KernelType::KernelNoSF,
+        m, n, max_k, num_groups, major_a, major_b,
+        torch::kBFloat16, d.scalar_type(), c.has_value(),
+        device_runtime->get_num_sms());
+
+    // Reshape the flattened K-major inputs
+    const auto& a_view = a.view({sum_k, m});
+    const auto& b_view = b.view({sum_k, n});
+
+    // Requires no TMA splits
+    const auto& tensor_map_a = make_tma_a_desc(major_a, a_view, m, sum_k,
+                                               SM90ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
+                                               config.block_k,
+                                               static_cast<int>(a_view.stride(get_non_contiguous_dim(major_a))), 1,
+                                               config.smem_config.swizzle_a_mode);
+    const auto& tensor_map_b = make_tma_b_desc(major_b, b_view, n, sum_k,
+                                               SM90ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+                                               config.block_k,
+                                               static_cast<int>(b_view.stride(get_non_contiguous_dim(major_b))), 1,
+                                               config.smem_config.swizzle_b_mode);
+    const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
+                                                SM90ArchSpec::get_cd_store_block_m(config.block_m, true),
+                                                SM90ArchSpec::get_cd_store_block_n(config.block_n),
+                                                static_cast<int>(d.stride(-2)), num_groups,
+                                                config.smem_config.swizzle_cd_mode);
+
+    if (c.has_value()) {
+        if (c->data_ptr() == d.data_ptr()) {
+            DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
+        } else {
+            d.copy_(c.value());
+        }
+    }
+
+    const SM90BF16GemmRuntime::Args& args = {
+        .m = m, .n = n, .k = sum_k,
+        .num_groups = num_groups,
+        .compiled_dims = compiled_dims,
+        .gemm_config = config,
+        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .grouped_layout = ks_tensor.data_ptr(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_d = tensor_map_d,
+    };
+    const auto& code = SM90BF16GemmRuntime::generate(args);
+    const auto& runtime = compiler->build("sm90_bf16_k_grouped_gemm_contiguous", code);
+    SM90BF16GemmRuntime::launch(runtime, args);
+}
+
 static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                 const torch::Tensor& b,
                                                 const torch::Tensor& d,
